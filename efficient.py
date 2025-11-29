@@ -195,30 +195,27 @@ def rand_bbox(size, lam):
     
     return bbx1, bby1, bbx2, bby2
 
-# ResNet18 Model with unfrozen last residual block
-class ResNetDetector(nn.Module):
+# EfficientNet Model with reduced classifier
+class EfficientNetDetector(nn.Module):
     def __init__(self, num_classes=config['NUM_CLASSES'], pretrained=True):
-        super(ResNetDetector, self).__init__()
+        super(EfficientNetDetector, self).__init__()
         
-        # Use ResNet18
-        self.model = models.resnet18(pretrained=pretrained)
+        # Use EfficientNet which is widely available
+        self.model = models.efficientnet_b0(pretrained=pretrained)
         
-        # Freeze all layers initially
+        # Freeze all layers except the last MBConv block
         for param in self.model.parameters():
             param.requires_grad = False
         
-        # Unfreeze only the last residual block (layer4)
-        for param in self.model.layer4.parameters():
+        # Unfreeze the last MBConv block
+        for param in self.model.features[-1].parameters():
             param.requires_grad = True
         
-        # Replace the classifier
-        in_features = self.model.fc.in_features
-        self.model.fc = nn.Sequential(
+        # Replace the classifier with a smaller one
+        in_features = self.model.classifier[1].in_features
+        self.model.classifier = nn.Sequential(
             nn.Dropout(config['DROPOUT']),
-            nn.Linear(in_features, 512),
-            nn.ReLU(),
-            nn.Dropout(config['DROPOUT']),
-            nn.Linear(512, num_classes)
+            nn.Linear(in_features, num_classes)  # Reduced from 256 to direct classification
         )
     
     def forward(self, x):
@@ -336,7 +333,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
                 'config': config
-            }, os.path.join(config['SAVE_DIR'], 'resnet_bes_model.pth'))
+            }, os.path.join(config['SAVE_DIR'], 'model.pth'))
             print(f'New best model saved with accuracy: {val_acc:.2f}%')
     
     # Save training history
@@ -459,16 +456,10 @@ def main():
     else:
         test_loader = None
     
-    # Use ResNet18 model
-    model = ResNetDetector(num_classes=config['NUM_CLASSES'], 
+    # Use EfficientNet model
+    model = EfficientNetDetector(num_classes=config['NUM_CLASSES'], 
                              pretrained=config['PRETRAINED'])
     model = model.to(device)
-    
-    # Print which layers are trainable
-    print("\nTrainable layers:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"  {name}")
     
     # Optimizer with weight decay
     optimizer = optim.Adam(
@@ -494,7 +485,7 @@ def main():
     plot_training_history(history)
     
     # Load best model for evaluation
-    best_model_path = os.path.join(config['SAVE_DIR'], 'resnet_best_model.pth')
+    best_model_path = os.path.join(config['SAVE_DIR'], 'efficient_best_model.pth')
     if os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -529,7 +520,7 @@ def main():
         'classes': config['CLASSES'],
         'accuracy': accuracy,
         'class_weights': class_weights.cpu().numpy()
-    }, os.path.join(config['SAVE_DIR'], 'resnet_final_model.pth'))
+    }, os.path.join(config['SAVE_DIR'], 'efficient_final_model.pth'))
     
     # Save config to JSON
     with open(os.path.join(config['SAVE_DIR'], 'config.json'), 'w') as f:
@@ -577,7 +568,7 @@ def evaluate_model(model, test_loader):
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(os.path.join(config['LOG_DIR'], 'resnet_confusion_matrix.png'))
+    plt.savefig(os.path.join(config['LOG_DIR'], 'confusion_matrix.png'))
     plt.close()  # Close to avoid display issues
     
     return accuracy, cm, report, all_preds, all_labels, all_paths
@@ -606,7 +597,7 @@ def plot_training_history(history):
     ax2.grid(True)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(config['LOG_DIR'], 'resnet_training_history.png'))
+    plt.savefig(os.path.join(config['LOG_DIR'], 'training_history.png'))
     plt.close()  # Close to avoid display issues
 
 if __name__ == "__main__":

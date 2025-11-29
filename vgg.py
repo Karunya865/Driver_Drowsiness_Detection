@@ -40,7 +40,7 @@ config = {
     # Training parameters
     'BATCH_SIZE': 16,
     'LEARNING_RATE': 1e-4,
-    'NUM_EPOCHS': 10,
+    'NUM_EPOCHS': 20,
     'IMG_SIZE': 224,
     'PATIENCE': 5,  # For early stopping
     
@@ -195,34 +195,104 @@ def rand_bbox(size, lam):
     
     return bbx1, bby1, bbx2, bby2
 
-# ResNet18 Model with unfrozen last residual block
-class ResNetDetector(nn.Module):
+# VGG Model with Blocks 1-4 used and Block 5 frozen
+class VGGDetector(nn.Module):
     def __init__(self, num_classes=config['NUM_CLASSES'], pretrained=True):
-        super(ResNetDetector, self).__init__()
+        super(VGGDetector, self).__init__()
         
-        # Use ResNet18
-        self.model = models.resnet18(pretrained=pretrained)
+        # Use VGG16 which has 5 convolutional blocks
+        self.model = models.vgg16(pretrained=pretrained)
         
         # Freeze all layers initially
         for param in self.model.parameters():
             param.requires_grad = False
         
-        # Unfreeze only the last residual block (layer4)
-        for param in self.model.layer4.parameters():
+        # Unfreeze Blocks 1-4 (features[0] to features[23])
+        # VGG16 features breakdown:
+        # Block 1: features[0] to features[4]  (2 conv + 1 pool)
+        # Block 2: features[5] to features[9]  (2 conv + 1 pool)
+        # Block 3: features[10] to features[16] (3 conv + 1 pool)
+        # Block 4: features[17] to features[23] (3 conv + 1 pool)
+        # Block 5: features[24] to features[30] (3 conv + 1 pool)
+        
+        # Unfreeze Blocks 1-4 (layers 0 to 23)
+        for param in self.model.features[:24].parameters():
             param.requires_grad = True
         
-        # Replace the classifier
-        in_features = self.model.fc.in_features
-        self.model.fc = nn.Sequential(
-            nn.Dropout(config['DROPOUT']),
+        # Keep Block 5 frozen (layers 24 to 30)
+        for param in self.model.features[24:].parameters():
+            param.requires_grad = False
+        
+        # Replace the classifier with a custom one
+        in_features = self.model.classifier[0].in_features
+        
+        self.model.classifier = nn.Sequential(
             nn.Linear(in_features, 512),
-            nn.ReLU(),
+            nn.ReLU(True),
             nn.Dropout(config['DROPOUT']),
-            nn.Linear(512, num_classes)
+            nn.Linear(512, 256),
+            nn.ReLU(True),
+            nn.Dropout(config['DROPOUT']),
+            nn.Linear(256, num_classes)
         )
     
     def forward(self, x):
         return self.model(x)
+
+# Alternative VGG implementation with more explicit block control
+class VGGDrowsinessDetector(nn.Module):
+    def __init__(self, num_classes=config['NUM_CLASSES'], pretrained=True):
+        super(VGGDrowsinessDetector, self).__init__()
+        
+        # Load pretrained VGG16
+        vgg = models.vgg16(pretrained=pretrained)
+        
+        # Extract features (convolutional blocks)
+        self.features = vgg.features
+        
+        # Freeze Block 5 (last convolutional block)
+        # Block 5 consists of layers 24 to 30 in VGG16 features
+        for i in range(24, 31):  # Layers 24 to 30
+            for param in self.features[i].parameters():
+                param.requires_grad = False
+        
+        # Adaptive average pooling
+        self.avgpool = nn.AdaptiveAvgPool2d((7, 7))
+        
+        # Custom classifier
+        self.classifier = nn.Sequential(
+            nn.Linear(512 * 7 * 7, 4096),
+            nn.ReLU(True),
+            nn.Dropout(config['DROPOUT']),
+            nn.Linear(4096, 1024),
+            nn.ReLU(True),
+            nn.Dropout(config['DROPOUT']),
+            nn.Linear(1024, num_classes)
+        )
+        
+        # Initialize classifier weights
+        self._initialize_weights()
+    
+    def _initialize_weights(self):
+        for m in self.classifier:
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x):
+        # Forward through features (Blocks 1-5)
+        x = self.features(x)
+        
+        # Adaptive pooling
+        x = self.avgpool(x)
+        
+        # Flatten
+        x = torch.flatten(x, 1)
+        
+        # Forward through classifier
+        x = self.classifier(x)
+        
+        return x
 
 # Training function with advanced augmentations
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, num_epochs):
@@ -336,7 +406,7 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
                 'optimizer_state_dict': optimizer.state_dict(),
                 'val_acc': val_acc,
                 'config': config
-            }, os.path.join(config['SAVE_DIR'], 'resnet_bes_model.pth'))
+            }, os.path.join(config['SAVE_DIR'], 'model.pth'))
             print(f'New best model saved with accuracy: {val_acc:.2f}%')
     
     # Save training history
@@ -393,9 +463,36 @@ def person_aware_split(dataset, val_size=0.2, random_state=42):
     
     return train_indices, val_indices
 
+# Function to print layer information
+def print_model_layers(model):
+    print("VGG16 Layer Information:")
+    print("=======================")
+    
+    # For standard VGG model
+    if hasattr(model, 'model') and hasattr(model.model, 'features'):
+        features = model.model.features
+        print("Features layers (Convolutional Blocks):")
+        for i, layer in enumerate(features):
+            print(f"Layer {i}: {layer.__class__.__name__} - Trainable: {any(param.requires_grad for param in layer.parameters())}")
+    
+    # For custom VGG model
+    elif hasattr(model, 'features'):
+        features = model.features
+        print("Features layers (Convolutional Blocks):")
+        for i, layer in enumerate(features):
+            print(f"Layer {i}: {layer.__class__.__name__} - Trainable: {any(param.requires_grad for param in layer.parameters())}")
+    
+    print("\nClassifier layers:")
+    if hasattr(model, 'model') and hasattr(model.model, 'classifier'):
+        for i, layer in enumerate(model.model.classifier):
+            print(f"Layer {i}: {layer.__class__.__name__}")
+    elif hasattr(model, 'classifier'):
+        for i, layer in enumerate(model.classifier):
+            print(f"Layer {i}: {layer.__class__.__name__}")
+
 # Main training function
 def main():
-    print("Starting Driver Drowsiness Detection Training...")
+    print("Starting Driver Drowsiness Detection Training with VGG...")
     print(f"Number of classes: {config['NUM_CLASSES']}")
     print(f"Classes: {config['CLASSES']}")
     
@@ -459,20 +556,18 @@ def main():
     else:
         test_loader = None
     
-    # Use ResNet18 model
-    model = ResNetDetector(num_classes=config['NUM_CLASSES'], 
+    # Use VGG model with Blocks 1-4 trainable and Block 5 frozen
+    model = VGGDetector(num_classes=config['NUM_CLASSES'], 
                              pretrained=config['PRETRAINED'])
     model = model.to(device)
     
-    # Print which layers are trainable
-    print("\nTrainable layers:")
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-            print(f"  {name}")
+    # Print model layer information
+    print_model_layers(model)
     
-    # Optimizer with weight decay
+    # Optimizer with weight decay - only optimize parameters that require gradients
+    trainable_params = filter(lambda p: p.requires_grad, model.parameters())
     optimizer = optim.Adam(
-        model.parameters(), 
+        trainable_params, 
         lr=config['LEARNING_RATE'], 
         weight_decay=config['WEIGHT_DECAY']
     )
@@ -483,8 +578,11 @@ def main():
     )
     
     # Print model summary
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters()):,}")
-    print(f"Trainable parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Frozen parameters: {total_params - trainable_params:,}")
     
     # Train the model
     history = train_model(model, train_loader, val_loader, criterion, 
@@ -494,7 +592,7 @@ def main():
     plot_training_history(history)
     
     # Load best model for evaluation
-    best_model_path = os.path.join(config['SAVE_DIR'], 'resnet_best_model.pth')
+    best_model_path = os.path.join(config['SAVE_DIR'], 'vgg_best_model.pth')
     if os.path.exists(best_model_path):
         checkpoint = torch.load(best_model_path)
         model.load_state_dict(checkpoint['model_state_dict'])
@@ -529,7 +627,7 @@ def main():
         'classes': config['CLASSES'],
         'accuracy': accuracy,
         'class_weights': class_weights.cpu().numpy()
-    }, os.path.join(config['SAVE_DIR'], 'resnet_final_model.pth'))
+    }, os.path.join(config['SAVE_DIR'], 'vgg_final_model.pth'))
     
     # Save config to JSON
     with open(os.path.join(config['SAVE_DIR'], 'config.json'), 'w') as f:
@@ -577,7 +675,7 @@ def evaluate_model(model, test_loader):
     plt.ylabel('True Label')
     plt.xlabel('Predicted Label')
     plt.tight_layout()
-    plt.savefig(os.path.join(config['LOG_DIR'], 'resnet_confusion_matrix.png'))
+    plt.savefig(os.path.join(config['LOG_DIR'], 'confusion_matrix.png'))
     plt.close()  # Close to avoid display issues
     
     return accuracy, cm, report, all_preds, all_labels, all_paths
@@ -606,7 +704,7 @@ def plot_training_history(history):
     ax2.grid(True)
     
     plt.tight_layout()
-    plt.savefig(os.path.join(config['LOG_DIR'], 'resnet_training_history.png'))
+    plt.savefig(os.path.join(config['LOG_DIR'], 'training_history.png'))
     plt.close()  # Close to avoid display issues
 
 if __name__ == "__main__":
